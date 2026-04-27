@@ -56,23 +56,36 @@ async def ensure_sz_decimals_cached(info: Info) -> None:
         _sz_decimals_cache = await asyncio.to_thread(_fetch_sz_decimals, info)
 
 
-def _fetch_account_equity(info: Info, address: str) -> float:
+def _fetch_account_state(info: Info, address: str) -> tuple[float, float]:
+    # Returns (equity, available_margin). Available margin is equity minus margin already
+    # locked by open positions — what's actually free to back a new entry.
     # Unified accounts: spot USDC is the total collateral pool; perps equity is only the
     # margin portion. Standard accounts: perps equity is the full pool; spot USDC is 0.
     # max() returns the correct total for both account types.
     user_state = info.user_state(address)
-    perps_equity = float(user_state.get("marginSummary", {}).get("accountValue", 0))
+    margin = user_state.get("marginSummary", {})
+    perps_equity = float(margin.get("accountValue", 0))
+    margin_used = float(margin.get("totalMarginUsed", 0))
     spot_state = info.spot_user_state(address)
     spot_usdc = 0.0
     for balance in spot_state.get("balances", []):
         if balance["coin"] == "USDC":
             spot_usdc = float(balance["total"])
             break
-    return max(perps_equity, spot_usdc)
+    equity = max(perps_equity, spot_usdc)
+    return equity, equity - margin_used
+
+
+def _fetch_account_equity(info: Info, address: str) -> float:
+    return _fetch_account_state(info, address)[0]
 
 
 async def fetch_account_equity(info: Info, address: str) -> float:
     return await asyncio.to_thread(_fetch_account_equity, info, address)
+
+
+async def fetch_account_state(info: Info, address: str) -> tuple[float, float]:
+    return await asyncio.to_thread(_fetch_account_state, info, address)
 
 
 async def fetch_mark_price(info: Info, coin: str) -> float:
@@ -133,7 +146,7 @@ async def _validate_and_size(
         rejection = f"mark price {mark_price} already at or past TP {tp_price}"
         logger.warning(f"Signal dropped: {rejection} | coin={coin}")
         return mark_price, 0, 0, leverage, rejection
-    equity = await fetch_account_equity(info, settings.hl_account_address)
+    equity, available_margin = await fetch_account_state(info, settings.hl_account_address)
     if equity <= 0:
         logger.error(f"Account equity is zero — skipping | coin={coin}")
         return mark_price, 0, 0, leverage, "zero equity"
@@ -168,6 +181,15 @@ async def _validate_and_size(
             f" | original=${notional:.2f} | new_size={min_size}"
         )
         size = min_size
+        notional = size * mark_price
+    required_margin = notional / leverage
+    if required_margin > available_margin:
+        rejection = (
+            f"insufficient balance — required margin ${required_margin:.2f}"
+            f" > available ${available_margin:.2f}"
+        )
+        logger.warning(f"Signal dropped: {rejection} | coin={coin}")
+        return mark_price, 0, 0, leverage, rejection
     return mark_price, size, equity, leverage, ""
 
 
