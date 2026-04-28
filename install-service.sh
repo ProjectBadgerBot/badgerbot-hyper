@@ -42,7 +42,7 @@ SERVICE
 
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
 
     echo ""
     echo "Bot is running as a system service ($SERVICE_NAME). Check the readme to check the status and logs."
@@ -87,7 +87,7 @@ SERVICE
 
     systemctl --user daemon-reload
     systemctl --user enable "$SERVICE_NAME"
-    systemctl --user start "$SERVICE_NAME"
+    systemctl --user restart "$SERVICE_NAME"
 
     echo ""
     echo "Bot is running as a user service ($SERVICE_NAME). Check the readme to check the status and logs."
