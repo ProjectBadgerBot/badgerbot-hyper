@@ -11,6 +11,7 @@ from hyperliquid.utils import constants
 from config.settings import Settings, load_settings
 from services.position_monitor import run_position_monitor
 from services.signal_consumer import connect_and_listen
+from services.updater import run_updater
 from services.telegram_bot import BotState, TelegramBot
 from services.trade_executor import build_exchange, load_leverage_config, make_signal_handler, safe_spot_meta
 from storage.trade_log import fetch_open_trades, init_trade_log, insert_trade, repair_trade_tpsl, update_trade_oids, update_trade_status
@@ -230,10 +231,18 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop_event.set)
 
     logger.info("Starting signal consumer, position monitor, and Telegram bot...")
-    results = await asyncio.gather(
+    
+    tasks = [
         connect_and_listen(signal_handler, settings, stop_event, notify=telegram_bot.send),
         telegram_bot.run(stop_event),
         run_position_monitor(info, settings, telegram_bot.send, stop_event, exchange),
+    ]
+
+    if settings.auto_update_enabled:
+        tasks.append(run_updater(settings.auto_update_interval_hours, stop_event, notify=telegram_bot.send))
+
+    results = await asyncio.gather(
+        *tasks,
         return_exceptions=True,
     )
     for result in results:

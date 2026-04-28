@@ -181,6 +181,7 @@ sudo apt update && sudo apt install -y python3.12 python3.12-venv git
 
 git clone https://github.com/ProjectBadgerBot/badgerbot-hyper.git
 cd badgerbot-hyper
+git config --global --add safe.directory "$(pwd)"
 
 bash setup.sh
 ```
