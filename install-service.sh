@@ -11,6 +11,13 @@ if [ ! -f "$PYTHON" ]; then
     exit 1
 fi
 
+# Allow git operations from inside the service when the repo and runtime user
+# differ in ownership (required for the auto-updater's `git fetch`/`git pull`).
+if ! git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "$WORK_DIR"; then
+    git config --global --add safe.directory "$WORK_DIR"
+    echo "Added $WORK_DIR to git safe.directory."
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
     # --- Root: install as a system service ---
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -35,7 +42,7 @@ SERVICE
 
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"
-    systemctl start "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME"
 
     echo ""
     echo "Bot is running as a system service ($SERVICE_NAME). Check the readme to check the status and logs."
@@ -80,7 +87,7 @@ SERVICE
 
     systemctl --user daemon-reload
     systemctl --user enable "$SERVICE_NAME"
-    systemctl --user start "$SERVICE_NAME"
+    systemctl --user restart "$SERVICE_NAME"
 
     echo ""
     echo "Bot is running as a user service ($SERVICE_NAME). Check the readme to check the status and logs."

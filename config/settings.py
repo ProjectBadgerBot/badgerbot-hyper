@@ -30,6 +30,8 @@ class Settings:
     telegram_authorized_user_id: int
     position_poll_interval_seconds: int
     algorithms: list[str]
+    auto_update_enabled: bool
+    auto_update_interval_hours: int
 
 
 def _parse_algorithms(raw: str | None) -> list[str]:
@@ -64,4 +66,6 @@ def load_settings() -> Settings:
         telegram_authorized_user_id=int(os.environ["TELEGRAM_AUTHORIZED_USER_ID"]),
         position_poll_interval_seconds=int(os.getenv("POSITION_POLL_INTERVAL_SECONDS", "15")),
         algorithms=_parse_algorithms(os.getenv("ALGORITHMS")),
+        auto_update_enabled=os.getenv("AUTO_UPDATE_ENABLED", "true").lower() == "true",
+        auto_update_interval_hours=int(os.getenv("AUTO_UPDATE_INTERVAL_HOURS", "24")),
     )
