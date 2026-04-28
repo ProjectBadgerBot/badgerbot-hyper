@@ -11,6 +11,13 @@ if [ ! -f "$PYTHON" ]; then
     exit 1
 fi
 
+# Allow git operations from inside the service when the repo and runtime user
+# differ in ownership (required for the auto-updater's `git fetch`/`git pull`).
+if ! git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "$WORK_DIR"; then
+    git config --global --add safe.directory "$WORK_DIR"
+    echo "Added $WORK_DIR to git safe.directory."
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
     # --- Root: install as a system service ---
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
