@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import subprocess
 from typing import Callable, Coroutine
 
@@ -9,6 +10,44 @@ logger = logging.getLogger("Updater")
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_EXAMPLE_PATH = os.path.join(REPO_DIR, ".env.example")
 ENV_PATH = os.path.join(REPO_DIR, ".env")
+
+
+def _detect_systemd_unit() -> tuple[str | None, bool]:
+    """Inspects /proc/self/cgroup to find the systemd unit managing this process.
+
+    Returns (unit_name, is_system_unit). Returns (None, False) when the process
+    is not running under a systemd .service unit (e.g. dev runs via `python main.py`).
+    """
+    try:
+        with open("/proc/self/cgroup") as f:
+            content = f.read()
+    except OSError:
+        return None, False
+
+    for line in content.splitlines():
+        path = line.rsplit(":", 1)[-1]
+        services = re.findall(r"/([^/]+)\.service(?=/|$)", path)
+        if not services:
+            continue
+        # The leaf .service is the bot's unit; an outer "user@<uid>.service"
+        # is the systemd user manager and signals user scope.
+        leaf = services[-1]
+        if leaf.startswith("user@"):
+            continue
+        is_user = any(s.startswith("user@") for s in services) or "user.slice" in path
+        return leaf, not is_user
+    return None, False
+
+
+SYSTEMD_UNIT, SYSTEMD_IS_SYSTEM = _detect_systemd_unit()
+
+
+def _journalctl_hint() -> str:
+    if SYSTEMD_UNIT is None:
+        return "Check the bot's logs for details."
+    if SYSTEMD_IS_SYSTEM:
+        return f"Check logs: <code>journalctl -u {SYSTEMD_UNIT} -n 50</code>"
+    return f"Check logs: <code>journalctl --user -u {SYSTEMD_UNIT} -n 50</code>"
 
 
 def _parse_env_keys(filepath: str) -> set[str]:
@@ -166,22 +205,34 @@ async def perform_update(notify: Callable[[str], Coroutine]) -> bool:
             logger.info(f"New .env.example keys detected: {new_env_keys}")
             await notify(env_notice)
 
-        logger.info(f"Updated from {old_rev} to {new_rev}. Restarting service...")
+        if SYSTEMD_UNIT is None:
+            logger.warning("Not running under a systemd service unit; skipping restart.")
+            await notify(
+                f"🚀 <b>Auto-update successful</b>\n"
+                f"Updated from <code>{old_rev}</code> to <code>{new_rev}</code>."
+                f"{pip_warning}\n"
+                f"⚠️ Bot is not running under systemd — please restart it manually for the update to take effect."
+            )
+            return True
+
+        logger.info(
+            f"Updated from {old_rev} to {new_rev}. Restarting unit '{SYSTEMD_UNIT}' "
+            f"({'system' if SYSTEMD_IS_SYSTEM else 'user'})..."
+        )
         await notify(
             f"🚀 <b>Auto-update successful</b>\n"
             f"Updated from <code>{old_rev}</code> to <code>{new_rev}</code>."
             f"{pip_warning}\n"
-            f"Restarting service..."
+            f"Restarting <code>{SYSTEMD_UNIT}</code>..."
         )
 
         await asyncio.sleep(3)
 
-        is_root = os.getuid() == 0
         env = os.environ.copy()
-        if is_root:
-            cmd = ["systemctl", "restart", "badgerbot"]
+        if SYSTEMD_IS_SYSTEM:
+            cmd = ["systemctl", "restart", SYSTEMD_UNIT]
         else:
-            cmd = ["systemctl", "--user", "restart", "badgerbot"]
+            cmd = ["systemctl", "--user", "restart", SYSTEMD_UNIT]
             if "XDG_RUNTIME_DIR" not in env:
                 env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
 
@@ -198,7 +249,17 @@ async def run_updater(
     notify: Callable[[str], Coroutine]
 ):
     """Background task that periodically checks for and applies updates."""
-    logger.info(f"Auto-updater initialized. Interval: {interval_hours} hour(s).")
+    if SYSTEMD_UNIT is None:
+        logger.warning(
+            f"Auto-updater initialized (interval: {interval_hours}h), but no systemd "
+            f"service unit was detected — updates will be pulled but not auto-restarted."
+        )
+    else:
+        scope = "system" if SYSTEMD_IS_SYSTEM else "user"
+        logger.info(
+            f"Auto-updater initialized. Interval: {interval_hours} hour(s). "
+            f"Detected unit: '{SYSTEMD_UNIT}' ({scope})."
+        )
 
     await asyncio.sleep(60)
 
@@ -221,7 +282,7 @@ async def run_updater(
                 logger.error("Update check failed after 5 attempts, giving up for this cycle.")
                 await notify(
                     "⚠️ <b>Auto-update check failed</b> after 5 attempts. Will try again next cycle.\n\n"
-                    "Check logs: <code>journalctl -u badgerbot -n 50</code>"
+                    f"{_journalctl_hint()}"
                 )
             elif update_status is True:
                 success = False
@@ -242,7 +303,7 @@ async def run_updater(
                 else:
                     await notify(
                         "⚠️ <b>Auto-update failed</b> after 5 attempts. Will try again next cycle.\n\n"
-                        "Check logs: <code>journalctl -u badgerbot -n 50</code>"
+                        f"{_journalctl_hint()}"
                     )
 
             for _ in range(interval_hours * 360):
