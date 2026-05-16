@@ -231,23 +231,76 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop_event.set)
 
     logger.info("Starting signal consumer, position monitor, and Telegram bot...")
-    
-    tasks = [
-        connect_and_listen(signal_handler, settings, stop_event, notify=telegram_bot.send),
-        telegram_bot.run(stop_event),
-        run_position_monitor(info, settings, telegram_bot.send, stop_event, exchange),
+
+    # Named tasks let us identify which critical service died. Anything in this list is
+    # load-bearing — if any of them exit (cleanly or otherwise) while the bot is supposed
+    # to be running, we treat it as a crash, alert the user, cancel siblings, and exit
+    # non-zero so systemd restarts the unit. The previous gather(return_exceptions=True)
+    # swallowed exceptions and kept the bot half-alive, which is what caused 6 days of
+    # zombie trades after position_monitor died silently on a 502.
+    named_tasks: list[tuple[str, asyncio.Task]] = [
+        ("signal_consumer", asyncio.create_task(
+            connect_and_listen(signal_handler, settings, stop_event, notify=telegram_bot.send),
+            name="signal_consumer",
+        )),
+        ("telegram_bot", asyncio.create_task(
+            telegram_bot.run(stop_event), name="telegram_bot",
+        )),
+        ("position_monitor", asyncio.create_task(
+            run_position_monitor(info, settings, telegram_bot.send, stop_event, exchange),
+            name="position_monitor",
+        )),
     ]
 
     if settings.auto_update_enabled:
-        tasks.append(run_updater(settings.auto_update_interval_hours, stop_event, notify=telegram_bot.send))
+        named_tasks.append(("updater", asyncio.create_task(
+            run_updater(settings.auto_update_interval_hours, stop_event, notify=telegram_bot.send),
+            name="updater",
+        )))
 
-    results = await asyncio.gather(
-        *tasks,
-        return_exceptions=True,
-    )
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Service exited with exception: {result}", exc_info=result)
+    tasks = [t for _, t in named_tasks]
+    name_by_task = {t: n for n, t in named_tasks}
+
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    fatal_exception = None
+    for finished in done:
+        name = name_by_task[finished]
+        if finished.cancelled():
+            logger.warning(f"Service '{name}' was cancelled")
+            continue
+        exc = finished.exception()
+        if exc is not None:
+            logger.critical(f"Service '{name}' crashed: {exc}", exc_info=exc)
+            try:
+                await telegram_bot.send(
+                    f"🚨 Service <code>{name}</code> crashed: <code>{exc}</code>\n"
+                    f"Bot is shutting down for restart."
+                )
+            except Exception as notify_error:
+                logger.error(f"Failed to send crash notification: {notify_error}")
+            fatal_exception = exc
+        else:
+            # A critical task returned normally while stop_event was NOT set — also a crash.
+            if not stop_event.is_set():
+                logger.critical(f"Service '{name}' exited unexpectedly (clean return)")
+                try:
+                    await telegram_bot.send(
+                        f"🚨 Service <code>{name}</code> exited unexpectedly — bot shutting down for restart."
+                    )
+                except Exception as notify_error:
+                    logger.error(f"Failed to send crash notification: {notify_error}")
+                fatal_exception = RuntimeError(f"{name} exited unexpectedly")
+
+    stop_event.set()
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    if fatal_exception is not None:
+        logger.error("Bot stopped due to service crash — exiting non-zero for systemd restart")
+        sys.exit(1)
 
     logger.info("Bot stopped cleanly.")
 

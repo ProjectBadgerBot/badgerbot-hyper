@@ -607,11 +607,39 @@ async def run_position_monitor(
 ) -> None:
     logger.info(f"Started — polling every {settings.position_poll_interval_seconds}s")
 
-    while not stop_event.is_set():
-        try:
-            await _check_closed_positions(info, settings, notify, exchange)
-            await _check_unprotected_trades(info, settings, notify)
-        except Exception as error:
-            logger.error(f"Poll cycle error: {error}", exc_info=True)
+    # Heartbeat every N cycles so silence is visible in logs. At a 16s poll interval,
+    # every 20 cycles is ≈ 5 minutes — enough to detect a dead task without log spam.
+    heartbeat_every = 20
+    cycle = 0
 
-        await asyncio.sleep(settings.position_poll_interval_seconds)
+    try:
+        while not stop_event.is_set():
+            cycle += 1
+            try:
+                await _check_closed_positions(info, settings, notify, exchange)
+                await _check_unprotected_trades(info, settings, notify)
+            except Exception as error:
+                logger.error(f"Poll cycle error: {error}", exc_info=True)
+
+            if cycle % heartbeat_every == 0:
+                open_trades = await fetch_open_trades()
+                logger.info(
+                    f"heartbeat | cycle={cycle} | open_trades={len(open_trades)}"
+                )
+
+            try:
+                await asyncio.sleep(settings.position_poll_interval_seconds)
+            except asyncio.CancelledError:
+                logger.warning("Sleep cancelled — exiting monitor loop")
+                raise
+    except asyncio.CancelledError:
+        logger.warning("PositionMonitor task cancelled")
+        raise
+    except BaseException as error:
+        # Anything that escapes the per-cycle handler (a BaseException, an error from
+        # the heartbeat path, etc.) must be logged loudly — silent task death is what
+        # caused the 6-day zombie incident in May.
+        logger.critical(f"PositionMonitor crashed: {error}", exc_info=True)
+        raise
+    finally:
+        logger.info("PositionMonitor exited")
