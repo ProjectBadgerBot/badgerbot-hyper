@@ -54,52 +54,24 @@ async def _cancel_counterpart_order(
                 )
                 return
             logger.warning(
-                f"Cancel {label} by oid non-ok, falling back to heuristic"
-                f" | coin={coin} | oid={target_oid} | result={result}"
+                f"Cancel {label} by oid non-ok | coin={coin} | oid={target_oid} | result={result}"
             )
         except Exception as error:
             logger.warning(
-                f"Cancel {label} by oid failed, falling back to heuristic"
-                f" | coin={coin} | oid={target_oid} | {error}"
+                f"Cancel {label} by oid failed | coin={coin} | oid={target_oid} | {error}"
             )
-
-    try:
-        orders = await asyncio.to_thread(
-            info.frontend_open_orders, settings.hl_account_address
-        )
-    except Exception as error:
-        logger.warning(f"Failed to fetch open orders for {label} cancel | {error}")
+        # Heuristic fallback intentionally disabled even when the by-oid path fails:
+        # if the OID is stale, the order was likely already cancelled or filled — no
+        # action needed. The heuristic risks cancelling another trade's protection.
         return
 
-    # Fallback: match by coin, trigger price (within 0.1%), and size (within 1%)
-    for order in orders:
-        if order.get("coin") != coin:
-            continue
-        trigger = float(order.get("triggerPx", 0))
-        order_sz = float(order.get("sz", 0))
-        if (
-            abs(trigger - target_px) / target_px < 0.001
-            and abs(order_sz - size) / size < 0.01
-        ):
-            oid = order.get("oid")
-            try:
-                result = await asyncio.to_thread(exchange.cancel, coin, oid)
-                if result.get("status") == "ok":
-                    logger.info(
-                        f"Cancelled orphaned {label} | coin={coin} | oid={oid} | trigger={trigger}"
-                    )
-                else:
-                    logger.warning(
-                        f"Cancel {label} returned non-ok | coin={coin} | result={result}"
-                    )
-            except Exception as error:
-                logger.warning(
-                    f"Failed to cancel {label} | coin={coin} | oid={oid} | {error}"
-                )
-            return
-
-    logger.info(
-        f"No matching {label} order found to cancel | coin={coin} | target_px={target_px}"
+    # SAFETY GUARD (2026-05-17 incident prevention): never fall back to the price+size
+    # heuristic. The heuristic can match a *different* trade's live TP/SL when DB rows
+    # share similar sizes (e.g. 0.0047 recurring lots), causing the bot to cancel
+    # legitimate protection. If we don't have an OID, accept the orphan and log loudly.
+    logger.warning(
+        f"Cannot cancel {label} — no stored OID and heuristic fallback disabled"
+        f" | coin={coin} | target_px={target_px} | trade_id={trade.get('id')}"
     )
 
 
@@ -155,17 +127,39 @@ def _find_trade_by_fill_oid(
 
 
 def _find_matching_trade(
-    open_trades: list[dict], fill_px: float, fill_sz: float
+    open_trades: list[dict], fill_px: float, fill_sz: float,
+    fill_time_ms: float | None = None,
 ) -> dict | None:
-    """Match fill to trade by size first (within 1%), then TP/SL price proximity."""
+    """Match fill to trade by size first (within 1%), then TP/SL price proximity.
+
+    SAFETY GUARD: when fill_time_ms is provided, only trades opened *before* the fill
+    are eligible. Without this, an old close fill (size-matching a recurring lot size
+    like 0.0047) could be attributed to a freshly-opened trade and trigger
+    cancellation of its live TP/SL — exactly the 2026-05-17 13:18 incident."""
+    if fill_time_ms is not None:
+        eligible = []
+        for t in open_trades:
+            try:
+                opened_ms = (
+                    datetime.fromisoformat(t["opened_at"])
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp() * 1000
+                )
+            except (TypeError, ValueError):
+                continue
+            if opened_ms < fill_time_ms:
+                eligible.append(t)
+    else:
+        eligible = open_trades
+
     # Phase 1: exact size match narrows candidates
     size_matched = [
         t
-        for t in open_trades
+        for t in eligible
         if float(t["size"]) > 0
         and abs(float(t["size"]) - fill_sz) / float(t["size"]) < 0.01
     ]
-    candidates = size_matched if size_matched else open_trades
+    candidates = size_matched if size_matched else eligible
 
     # Phase 2: closest TP/SL price as tiebreaker
     best_trade = None
@@ -319,7 +313,12 @@ async def _process_coin_closures(
         # Disambiguates tight and wide variants that share an identical size.
         trade, oid_status = _find_trade_by_fill_oid(pending_trades, fill.get("oid"))
         if trade is None:
-            trade = _find_matching_trade(pending_trades, fill_px, fill_sz)
+            # SAFETY: pass the fill's timestamp so the heuristic cannot attribute
+            # this fill to a trade opened AFTER it (2026-05-17 incident).
+            fill_time_ms = float(fill.get("time", 0)) or None
+            trade = _find_matching_trade(
+                pending_trades, fill_px, fill_sz, fill_time_ms=fill_time_ms
+            )
         if trade is None:
             break
 
