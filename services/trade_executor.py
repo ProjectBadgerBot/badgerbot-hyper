@@ -258,6 +258,59 @@ def _extract_trigger_oid(inner) -> str:
     return ""
 
 
+def _match_trigger_oid(orders: list, coin: str, trigger_px: float, size: float) -> str:
+    """Pick the trigger order on `coin` matching trigger_px (±0.1%) and size (±1%)."""
+    for order in orders:
+        if order.get("coin") != coin or not order.get("triggerPx"):
+            continue
+        try:
+            order_trigger = float(order["triggerPx"])
+            order_sz = float(order.get("sz", 0))
+        except (TypeError, ValueError):
+            continue
+        if trigger_px <= 0 or size <= 0:
+            continue
+        if (
+            abs(order_trigger - trigger_px) / trigger_px < 0.001
+            and abs(order_sz - size) / size < 0.01
+        ):
+            oid = order.get("oid")
+            if oid is not None:
+                return str(oid)
+    return ""
+
+
+async def _lookup_trigger_oids(
+    info: Info,
+    settings: Settings,
+    coin: str,
+    size: float,
+    tp_price: float,
+    sl_price: float,
+    need_tp: bool,
+    need_sl: bool,
+) -> tuple[str, str]:
+    """Resolve TP/SL oids by querying open orders after placement. Best-effort: returns
+    "" for each side that can't be resolved. Needed because HL's bulk_orders returns the
+    bare "waitingForTrigger" string for un-fired trigger orders, with no oid in the response."""
+    if not need_tp and not need_sl:
+        return "", ""
+    try:
+        raw_orders = await asyncio.to_thread(
+            info.frontend_open_orders, settings.hl_account_address
+        )
+    except Exception as error:
+        logger.warning(f"Trigger OID lookup failed | coin={coin} | {error}")
+        return "", ""
+    flat = []
+    for order in raw_orders:
+        flat.append(order)
+        flat.extend(order.get("children", []))
+    tp_oid = _match_trigger_oid(flat, coin, tp_price, size) if need_tp else ""
+    sl_oid = _match_trigger_oid(flat, coin, sl_price, size) if need_sl else ""
+    return tp_oid, sl_oid
+
+
 def _tpsl_status_ok(inner, label: str, coin: str) -> bool:
     """Check a single status item from a bulk_orders response."""
     # Trigger orders return the string "waitingForTrigger" on success.
@@ -277,6 +330,8 @@ def _tpsl_status_ok(inner, label: str, coin: str) -> bool:
 
 async def _open_with_tpsl(
     exchange: Exchange,
+    info: Info,
+    settings: Settings,
     coin: str,
     is_long: bool,
     size: float,
@@ -390,6 +445,19 @@ async def _open_with_tpsl(
     tp_oid = _extract_trigger_oid(tp_inner) if tp_ok else ""
     sl_oid = _extract_trigger_oid(sl_inner) if sl_ok else ""
 
+    # HL returns the bare "waitingForTrigger" string for un-fired trigger orders, so
+    # _extract_trigger_oid yields "" — resolve them via a follow-up open-orders query.
+    need_tp_lookup = tp_ok and not tp_oid
+    need_sl_lookup = sl_ok and not sl_oid
+    if need_tp_lookup or need_sl_lookup:
+        looked_tp, looked_sl = await _lookup_trigger_oids(
+            info, settings, coin, size, tp_price, sl_price, need_tp_lookup, need_sl_lookup
+        )
+        if need_tp_lookup and looked_tp:
+            tp_oid = looked_tp
+        if need_sl_lookup and looked_sl:
+            sl_oid = looked_sl
+
     if tp_ok:
         logger.info(f"TP placed @ {tp_price} (limit={tp_limit}) | oid={tp_oid} | coin={coin}")
     if sl_ok:
@@ -465,7 +533,7 @@ async def execute_signal(
     )
 
     fill_price, tp_ok, sl_ok, tp_oid, sl_oid = await _open_with_tpsl(
-        exchange, coin, is_long, size, leverage, tp_price, sl_price, mark_price
+        exchange, info, settings, coin, is_long, size, leverage, tp_price, sl_price, mark_price
     )
     if fill_price is None:
         log_signal(

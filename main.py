@@ -133,8 +133,9 @@ async def _reconcile_orphaned_positions(
 
     orphaned = {c: p for c, p in hl_positions.items() if c not in db_coins}
     unprotected = [t for t in open_trades if t["status"] == "UNPROTECTED"]
+    missing_oids = [t for t in open_trades if not t.get("tp_oid") or not t.get("sl_oid")]
 
-    if not orphaned and not unprotected:
+    if not orphaned and not unprotected and not missing_oids:
         return
 
     all_orders = await _fetch_all_orders(info, settings, logger)
@@ -179,6 +180,73 @@ async def _reconcile_orphaned_positions(
             f"Repaired UNPROTECTED trade id={trade['id']} {coin}"
             f" | TP: ${tp_px} | SL: ${sl_px}"
         )
+
+    # Backfill OIDs for any OPEN trade that's missing tp_oid or sl_oid. Legacy rows
+    # written before the OID-lookup fix have NULL oids; without this step, the
+    # cancellation/matching paths fall back to fragile heuristics. The 2026-05-17
+    # incident was caused by that fallback running against rows with NULL oids.
+    await _backfill_missing_oids(open_trades, all_orders, logger)
+
+
+def _greedy_assign(rows: list[dict], orders: list, coin: str,
+                   price_field: str, kind: str) -> dict[int, str]:
+    """1:1 greedy assignment of DB rows to HL trigger orders by (size, price)
+    proximity. `kind` is "profit" or "stop" to filter order types."""
+    candidates = [
+        o for o in orders
+        if o.get("coin") == coin and o.get("triggerPx")
+        and kind in o.get("orderType", "").lower()
+    ]
+    pairs = []
+    for r in rows:
+        target = float(r[price_field]) if r[price_field] is not None else 0
+        size = float(r["size"])
+        if target <= 0 or size <= 0:
+            continue
+        for o in candidates:
+            try:
+                o_px = float(o["triggerPx"])
+                o_sz = float(o.get("sz", 0))
+            except (TypeError, ValueError):
+                continue
+            if abs(o_px - target) / target >= 0.001 or abs(o_sz - size) / size >= 0.01:
+                continue
+            pairs.append((abs(o_px - target), r["id"], o["oid"]))
+    pairs.sort()
+    used_rows, used_oids, out = set(), set(), {}
+    for _, row_id, oid in pairs:
+        if row_id in used_rows or oid in used_oids:
+            continue
+        out[row_id] = str(oid)
+        used_rows.add(row_id)
+        used_oids.add(oid)
+    return out
+
+
+async def _backfill_missing_oids(open_trades: list[dict], all_orders: list, logger: logging.Logger) -> None:
+    missing = [t for t in open_trades if not t.get("tp_oid") or not t.get("sl_oid")]
+    if not missing:
+        return
+    by_coin: dict[str, list[dict]] = {}
+    for t in missing:
+        by_coin.setdefault(t["coin"], []).append(t)
+    for coin, rows in by_coin.items():
+        tp_map = _greedy_assign(rows, all_orders, coin, "tp_px", "profit")
+        sl_map = _greedy_assign(rows, all_orders, coin, "sl_px", "stop")
+        for t in rows:
+            new_tp = t.get("tp_oid") or tp_map.get(t["id"])
+            new_sl = t.get("sl_oid") or sl_map.get(t["id"])
+            if (new_tp and new_tp != t.get("tp_oid")) or (new_sl and new_sl != t.get("sl_oid")):
+                await update_trade_oids(t["id"], new_tp, new_sl)
+                logger.info(
+                    f"Backfilled OIDs | trade={t['id']} {coin}"
+                    f" | tp_oid={new_tp or 'MISSING'} sl_oid={new_sl or 'MISSING'}"
+                )
+            elif not new_tp or not new_sl:
+                logger.warning(
+                    f"Could not backfill OIDs | trade={t['id']} {coin}"
+                    f" | tp_oid={new_tp or 'MISSING'} sl_oid={new_sl or 'MISSING'}"
+                )
 
 
 async def run_startup_check(settings: Settings, info: Info, logger: logging.Logger) -> None:
@@ -231,23 +299,76 @@ async def main() -> None:
         loop.add_signal_handler(sig, stop_event.set)
 
     logger.info("Starting signal consumer, position monitor, and Telegram bot...")
-    
-    tasks = [
-        connect_and_listen(signal_handler, settings, stop_event, notify=telegram_bot.send),
-        telegram_bot.run(stop_event),
-        run_position_monitor(info, settings, telegram_bot.send, stop_event, exchange),
+
+    # Named tasks let us identify which critical service died. Anything in this list is
+    # load-bearing — if any of them exit (cleanly or otherwise) while the bot is supposed
+    # to be running, we treat it as a crash, alert the user, cancel siblings, and exit
+    # non-zero so systemd restarts the unit. The previous gather(return_exceptions=True)
+    # swallowed exceptions and kept the bot half-alive, which is what caused 6 days of
+    # zombie trades after position_monitor died silently on a 502.
+    named_tasks: list[tuple[str, asyncio.Task]] = [
+        ("signal_consumer", asyncio.create_task(
+            connect_and_listen(signal_handler, settings, stop_event, notify=telegram_bot.send),
+            name="signal_consumer",
+        )),
+        ("telegram_bot", asyncio.create_task(
+            telegram_bot.run(stop_event), name="telegram_bot",
+        )),
+        ("position_monitor", asyncio.create_task(
+            run_position_monitor(info, settings, telegram_bot.send, stop_event, exchange),
+            name="position_monitor",
+        )),
     ]
 
     if settings.auto_update_enabled:
-        tasks.append(run_updater(settings.auto_update_interval_hours, stop_event, notify=telegram_bot.send))
+        named_tasks.append(("updater", asyncio.create_task(
+            run_updater(settings.auto_update_interval_hours, stop_event, notify=telegram_bot.send),
+            name="updater",
+        )))
 
-    results = await asyncio.gather(
-        *tasks,
-        return_exceptions=True,
-    )
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Service exited with exception: {result}", exc_info=result)
+    tasks = [t for _, t in named_tasks]
+    name_by_task = {t: n for n, t in named_tasks}
+
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    fatal_exception = None
+    for finished in done:
+        name = name_by_task[finished]
+        if finished.cancelled():
+            logger.warning(f"Service '{name}' was cancelled")
+            continue
+        exc = finished.exception()
+        if exc is not None:
+            logger.critical(f"Service '{name}' crashed: {exc}", exc_info=exc)
+            try:
+                await telegram_bot.send(
+                    f"🚨 Service <code>{name}</code> crashed: <code>{exc}</code>\n"
+                    f"Bot is shutting down for restart."
+                )
+            except Exception as notify_error:
+                logger.error(f"Failed to send crash notification: {notify_error}")
+            fatal_exception = exc
+        else:
+            # A critical task returned normally while stop_event was NOT set — also a crash.
+            if not stop_event.is_set():
+                logger.critical(f"Service '{name}' exited unexpectedly (clean return)")
+                try:
+                    await telegram_bot.send(
+                        f"🚨 Service <code>{name}</code> exited unexpectedly — bot shutting down for restart."
+                    )
+                except Exception as notify_error:
+                    logger.error(f"Failed to send crash notification: {notify_error}")
+                fatal_exception = RuntimeError(f"{name} exited unexpectedly")
+
+    stop_event.set()
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    if fatal_exception is not None:
+        logger.error("Bot stopped due to service crash — exiting non-zero for systemd restart")
+        sys.exit(1)
 
     logger.info("Bot stopped cleanly.")
 
