@@ -12,7 +12,6 @@ from hyperliquid.utils import constants
 
 from config.settings import Settings
 from services.signal_consumer import log_signal, validate_signal
-from storage.trade_log import insert_trade, update_entry_fee, update_trade_status
 
 logger = logging.getLogger("TradeExecutor")
 
@@ -86,6 +85,26 @@ async def fetch_account_equity(info: Info, address: str) -> float:
 
 async def fetch_account_state(info: Info, address: str) -> tuple[float, float]:
     return await asyncio.to_thread(_fetch_account_state, info, address)
+
+
+def _fetch_position_szi(info: Info, address: str, coin: str) -> float:
+    """Signed position size for a coin (>0 long, <0 short, 0 flat)."""
+    user_state = info.user_state(address)
+    for ap in user_state.get("assetPositions", []):
+        pos = ap.get("position", {})
+        if pos.get("coin") == coin:
+            return float(pos.get("szi", 0))
+    return 0.0
+
+
+async def current_position_direction(info: Info, address: str, coin: str) -> str | None:
+    """Returns "LONG", "SHORT", or None (flat) for the coin's current net position."""
+    szi = await asyncio.to_thread(_fetch_position_szi, info, address, coin)
+    if szi > 0:
+        return "LONG"
+    if szi < 0:
+        return "SHORT"
+    return None
 
 
 async def fetch_mark_price(info: Info, coin: str) -> float:
@@ -215,102 +234,6 @@ def _trigger_limit_px(
     return round(float(f"{adjusted:.5g}"), _px_decimals(exchange, coin))
 
 
-def _fetch_post_trade_state(info: Info, address: str, coin: str) -> dict:
-    user_state = info.user_state(address)
-    spot_state = info.spot_user_state(address)
-    margin = user_state.get("marginSummary", {})
-    margin_used = float(margin.get("totalMarginUsed", 0))
-    spot_usdc = next(
-        (
-            float(b["total"])
-            for b in spot_state.get("balances", [])
-            if b["coin"] == "USDC"
-        ),
-        0.0,
-    )
-    perps_equity = float(margin.get("accountValue", 0))
-    account_value = max(perps_equity, spot_usdc)
-    available = account_value - margin_used
-    liq_px = None
-    for ap in user_state.get("assetPositions", []):
-        pos = ap.get("position", {})
-        if pos.get("coin") == coin and float(pos.get("szi", 0)) != 0:
-            raw_liq = pos.get("liquidationPx")
-            if raw_liq:
-                liq_px = float(raw_liq)
-            break
-    return {
-        "account_value": account_value,
-        "margin_used": margin_used,
-        "withdrawable": available,
-        "liq_px": liq_px,
-    }
-
-
-def _extract_trigger_oid(inner) -> str:
-    """Pull the order id from a TP/SL status item. Returns "" when HL only returned
-    the bare "waitingForTrigger" string (no oid available in that path)."""
-    if isinstance(inner, dict):
-        for key in ("resting", "filled"):
-            oid = inner.get(key, {}).get("oid") if isinstance(inner.get(key), dict) else None
-            if oid is not None:
-                return str(oid)
-    return ""
-
-
-def _match_trigger_oid(orders: list, coin: str, trigger_px: float, size: float) -> str:
-    """Pick the trigger order on `coin` matching trigger_px (±0.1%) and size (±1%)."""
-    for order in orders:
-        if order.get("coin") != coin or not order.get("triggerPx"):
-            continue
-        try:
-            order_trigger = float(order["triggerPx"])
-            order_sz = float(order.get("sz", 0))
-        except (TypeError, ValueError):
-            continue
-        if trigger_px <= 0 or size <= 0:
-            continue
-        if (
-            abs(order_trigger - trigger_px) / trigger_px < 0.001
-            and abs(order_sz - size) / size < 0.01
-        ):
-            oid = order.get("oid")
-            if oid is not None:
-                return str(oid)
-    return ""
-
-
-async def _lookup_trigger_oids(
-    info: Info,
-    settings: Settings,
-    coin: str,
-    size: float,
-    tp_price: float,
-    sl_price: float,
-    need_tp: bool,
-    need_sl: bool,
-) -> tuple[str, str]:
-    """Resolve TP/SL oids by querying open orders after placement. Best-effort: returns
-    "" for each side that can't be resolved. Needed because HL's bulk_orders returns the
-    bare "waitingForTrigger" string for un-fired trigger orders, with no oid in the response."""
-    if not need_tp and not need_sl:
-        return "", ""
-    try:
-        raw_orders = await asyncio.to_thread(
-            info.frontend_open_orders, settings.hl_account_address
-        )
-    except Exception as error:
-        logger.warning(f"Trigger OID lookup failed | coin={coin} | {error}")
-        return "", ""
-    flat = []
-    for order in raw_orders:
-        flat.append(order)
-        flat.extend(order.get("children", []))
-    tp_oid = _match_trigger_oid(flat, coin, tp_price, size) if need_tp else ""
-    sl_oid = _match_trigger_oid(flat, coin, sl_price, size) if need_sl else ""
-    return tp_oid, sl_oid
-
-
 def _tpsl_status_ok(inner, label: str, coin: str) -> bool:
     """Check a single status item from a bulk_orders response."""
     # Trigger orders return the string "waitingForTrigger" on success.
@@ -339,7 +262,7 @@ async def _open_with_tpsl(
     tp_price: float,
     sl_price: float,
     mark_price: float,
-) -> tuple[float | None, bool, bool, str, str]:
+) -> tuple[float | None, bool, bool]:
     """
     Opens a position and places per-lot TP/SL atomically via normalTpsl grouping.
 
@@ -348,8 +271,10 @@ async def _open_with_tpsl(
     own independent OCO pair (unlike positionTpsl, which is position-level and would
     overwrite TP/SL from other lots on the same coin).
 
-    Returns (fill_price, tp_ok, sl_ok, tp_oid, sl_oid). fill_price is None on entry
-    failure; OIDs are empty strings when unavailable.
+    We do not track per-order ids: Hyperliquid is the source of truth. The position
+    monitor reconciles live trigger orders against the live position size each cycle.
+
+    Returns (fill_price, tp_ok, sl_ok). fill_price is None on entry failure.
     """
     await asyncio.to_thread(exchange.update_leverage, leverage, coin, True)
     logger.info(f"Leverage set: {coin} {leverage}x cross")
@@ -408,11 +333,11 @@ async def _open_with_tpsl(
         )
     except Exception as error:
         logger.error(f"Entry+TP/SL order exception | coin={coin} | {error}")
-        return None, False, False, "", ""
+        return None, False, False
 
     if result.get("status") != "ok":
         logger.error(f"Entry+TP/SL placement failed | coin={coin} | result={result}")
-        return None, False, False, "", ""
+        return None, False, False
 
     statuses = result.get("response", {}).get("data", {}).get("statuses", [])
 
@@ -431,10 +356,10 @@ async def _open_with_tpsl(
             )
         elif "error" in entry_inner:
             logger.error(f"Entry order error | coin={coin} | error={entry_inner['error']}")
-            return None, False, False, "", ""
+            return None, False, False
     else:
         logger.error(f"Entry — unexpected status | coin={coin} | inner={entry_inner}")
-        return None, False, False, "", ""
+        return None, False, False
 
     # Parse TP/SL statuses (statuses[1] and statuses[2])
     tp_inner = statuses[1] if len(statuses) > 1 else {}
@@ -442,48 +367,12 @@ async def _open_with_tpsl(
     tp_ok = _tpsl_status_ok(tp_inner, "TP", coin)
     sl_ok = _tpsl_status_ok(sl_inner, "SL", coin)
 
-    tp_oid = _extract_trigger_oid(tp_inner) if tp_ok else ""
-    sl_oid = _extract_trigger_oid(sl_inner) if sl_ok else ""
-
-    # HL returns the bare "waitingForTrigger" string for un-fired trigger orders, so
-    # _extract_trigger_oid yields "" — resolve them via a follow-up open-orders query.
-    need_tp_lookup = tp_ok and not tp_oid
-    need_sl_lookup = sl_ok and not sl_oid
-    if need_tp_lookup or need_sl_lookup:
-        looked_tp, looked_sl = await _lookup_trigger_oids(
-            info, settings, coin, size, tp_price, sl_price, need_tp_lookup, need_sl_lookup
-        )
-        if need_tp_lookup and looked_tp:
-            tp_oid = looked_tp
-        if need_sl_lookup and looked_sl:
-            sl_oid = looked_sl
-
     if tp_ok:
-        logger.info(f"TP placed @ {tp_price} (limit={tp_limit}) | oid={tp_oid} | coin={coin}")
+        logger.info(f"TP placed @ {tp_price} (limit={tp_limit}) | coin={coin}")
     if sl_ok:
-        logger.info(f"SL placed @ {sl_price} (limit={sl_limit}) | oid={sl_oid} | coin={coin}")
+        logger.info(f"SL placed @ {sl_price} (limit={sl_limit}) | coin={coin}")
 
-    return fill_price, tp_ok, sl_ok, tp_oid, sl_oid
-
-
-async def _capture_entry_fee(
-    info: Info, settings: Settings, trade_id: int, coin: str, entry_px: float
-) -> None:
-    """Best-effort: fetch the entry fill fee and store it in the DB."""
-    try:
-        fills = await asyncio.to_thread(info.user_fills, settings.hl_account_address)
-        for fill in fills:
-            if fill.get("coin") != coin or "Open" not in fill.get("dir", ""):
-                continue
-            if abs(float(fill["px"]) - entry_px) / entry_px < 0.01:
-                await update_entry_fee(trade_id, float(fill.get("fee", 0)))
-                logger.info(
-                    f"Entry fee captured | trade={trade_id} | fee={fill['fee']}"
-                )
-                return
-        logger.warning(f"Entry fill not found for fee capture | trade={trade_id}")
-    except Exception as error:
-        logger.warning(f"Entry fee capture failed | trade={trade_id} | {error}")
+    return fill_price, tp_ok, sl_ok
 
 
 async def execute_signal(
@@ -500,6 +389,18 @@ async def execute_signal(
     direction = "LONG" if is_long else "SHORT"
     tp_price = float(signal["tp_price"])
     sl_price = float(signal["sl_price"])
+
+    # No direction flipping: while a coin holds opposite exposure, drop the signal so a
+    # single netted position never carries TP/SL pointing the wrong way. Same-direction
+    # signals add to the position; we re-enter the opposite side only once it is flat.
+    open_direction = await current_position_direction(
+        info, settings.hl_account_address, coin
+    )
+    if open_direction is not None and open_direction != direction:
+        reason = f"opposite to open {open_direction} position"
+        logger.info(f"Signal dropped: {reason} | coin={coin}")
+        log_signal({"coin": coin, "side": direction, "outcome": "rejected", "reason": reason})
+        return
 
     sizing = await _validate_and_size(
         signal, info, settings, leverage_config, batch_size
@@ -532,7 +433,7 @@ async def execute_signal(
         f" | size={size} | notional=${size * mark_price:.2f} | leverage={leverage}x"
     )
 
-    fill_price, tp_ok, sl_ok, tp_oid, sl_oid = await _open_with_tpsl(
+    fill_price, tp_ok, sl_ok = await _open_with_tpsl(
         exchange, info, settings, coin, is_long, size, leverage, tp_price, sl_price, mark_price
     )
     if fill_price is None:
@@ -550,26 +451,16 @@ async def execute_signal(
             )
         return
 
-    # Write trade record immediately after entry — Financial Safety Rule #4
-    trade_id = await insert_trade(
-        coin, direction, size, fill_price, tp_price, sl_price,
-        tp_order_id=tp_oid, sl_order_id=sl_oid,
-    )
-
-    direction_emoji = "🟢" if is_long else "🔴"
-
+    # No DB write: Hyperliquid is the source of truth. The position monitor reconciles
+    # live trigger orders against the live position size every cycle.
     if not tp_ok or not sl_ok:
-        await update_trade_status(trade_id, "UNPROTECTED")
-        logger.error(
-            f"POSITION UNPROTECTED — TP/SL failed | coin={coin} | trade_id={trade_id}"
-        )
+        logger.error(f"POSITION UNPROTECTED — TP/SL failed | coin={coin}")
         if notify:
             await notify(
                 f"⚠️ UNPROTECTED: {coin} {direction} @ <code>${fill_price:,.2f}</code> — TP/SL placement failed!"
             )
         return
 
-    asyncio.create_task(_capture_entry_fee(info, settings, trade_id, coin, fill_price))
     log_signal(
         {
             "coin": coin,
@@ -582,29 +473,6 @@ async def execute_signal(
     logger.info(
         f"Trade complete | coin={coin} | entry={fill_price} | TP={tp_price} | SL={sl_price}"
     )
-    if notify:
-        post = await asyncio.to_thread(
-            _fetch_post_trade_state, info, settings.hl_account_address, coin
-        )
-        notional = size * fill_price
-        liq_str = f"${post['liq_px']:,.2f}" if post["liq_px"] else "N/A"
-        margin_pct = (
-            (post["margin_used"] / post["account_value"] * 100)
-            if post["account_value"] > 0
-            else 0
-        )
-        await notify(
-            f"{direction_emoji} {coin} {direction} OPENED\n\n"
-            f"📐 Size: <code>{size} (${notional:,.2f})</code>\n"
-            f"💵 Entry: <code>${fill_price:,.2f}</code>\n"
-            f"✅ TP: <code>${tp_price:,.2f}</code>\n"
-            f"⛔ SL: <code>${sl_price:,.2f}</code>\n"
-            f"⚡ Leverage: <code>{leverage}x</code>\n"
-            f"💀 Liq: <code>{liq_str}</code>\n\n"
-            f"🏦 Account Value: <code>${post['account_value']:,.2f}</code>\n"
-            f"🎢 Margin Used: <code>${post['margin_used']:,.2f} ({margin_pct:.1f}%)</code>\n"
-            f"💰 Available: <code>${post['withdrawable']:,.2f}</code>"
-        )
 
 
 def make_signal_handler(

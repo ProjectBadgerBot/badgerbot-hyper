@@ -29,13 +29,11 @@ from hyperliquid.utils import constants
 from config.settings import load_settings
 from services.telegram_bot import BotState, TelegramBot
 from services.trade_executor import (
-    _fetch_post_trade_state,
     _open_with_tpsl,
     build_exchange,
     load_leverage_config,
     safe_spot_meta,
 )
-from storage.trade_log import close_trade, init_trade_log, insert_trade, update_trade_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,8 +103,8 @@ async def build_signal(info: Info, template: dict) -> dict:
 
 
 async def execute_with_fixed_size(
-    signal: dict, size: float, info, exchange, leverage_config: dict, notify, address: str
-) -> int | None:
+    signal: dict, size: float, info, exchange, settings, leverage_config: dict, notify
+) -> bool:
     coin = signal["coin_symbol"]
     is_long = signal["mode"] == "LONG"
     direction = signal["mode"]
@@ -115,42 +113,29 @@ async def execute_with_fixed_size(
     sl_price = float(signal["sl_price"])
     leverage = leverage_config.get(coin, leverage_config.get("DEFAULT", 3))
 
-    fill_price, tp_ok, sl_ok, tp_oid, sl_oid = await _open_with_tpsl(
-        exchange, coin, is_long=is_long, size=size, leverage=leverage,
-        tp_price=tp_price, sl_price=sl_price, mark_price=float(signal["price"])
+    fill_price, tp_ok, sl_ok = await _open_with_tpsl(
+        exchange, info, settings, coin, is_long, size, leverage,
+        tp_price, sl_price, float(signal["price"]),
     )
     if fill_price is None:
         logger.error(f"Entry failed | coin={coin}")
-        return None
-
-    trade_id = await insert_trade(
-        coin, direction, size, fill_price, tp_price, sl_price,
-        tp_order_id=tp_oid, sl_order_id=sl_oid,
-    )
+        return False
 
     if not tp_ok or not sl_ok:
-        await update_trade_status(trade_id, "UNPROTECTED")
-        logger.error(f"POSITION UNPROTECTED | coin={coin} | trade_id={trade_id}")
+        logger.error(f"POSITION UNPROTECTED | coin={coin}")
         await notify(f"⚠️ UNPROTECTED: {coin} {direction} @ ${fill_price:,.2f} — TP/SL failed!")
     else:
         logger.info(f"Trade complete | entry={fill_price} | TP={tp_price:.2f} | SL={sl_price:.2f}")
-        post = await asyncio.to_thread(_fetch_post_trade_state, info, address, coin)
         notional = size * fill_price
-        liq_str = f"${post['liq_px']:,.2f}" if post["liq_px"] else "N/A"
-        margin_pct = (post["margin_used"] / post["account_value"] * 100) if post["account_value"] > 0 else 0
         await notify(
             f"{direction_emoji} {coin} {direction} OPENED\n\n"
             f"📐 Size: {size} (${notional:,.2f})\n"
             f"💵 Entry: ${fill_price:,.2f}\n"
             f"🎯 TP: ${tp_price:,.2f}\n"
             f"⛔ SL: ${sl_price:,.2f}\n"
-            f"⚡ Leverage: {leverage}x\n"
-            f"💀 Liq: {liq_str}\n\n"
-            f"🏦 Account Value: ${post['account_value']:,.2f}\n"
-            f"🎢 Margin Used: ${post['margin_used']:,.2f} ({margin_pct:.1f}%)\n"
-            f"💰 Available: ${post['withdrawable']:,.2f}"
+            f"⚡ Leverage: {leverage}x"
         )
-    return trade_id
+    return True
 
 
 async def run_simulation(mode: str) -> None:
@@ -172,7 +157,6 @@ async def run_simulation(mode: str) -> None:
     bot_state = BotState()
     telegram_bot = TelegramBot(settings, info, exchange, bot_state)
 
-    await init_trade_log()
     min_size = await fetch_min_size(info, COIN)
 
     async with telegram_bot._app:
@@ -184,7 +168,7 @@ async def run_simulation(mode: str) -> None:
             f"🌐 Network: {_b('MAINNET')}"
         )
 
-        sim_trade_ids = []
+        opened_coins = set()
         for index, template in enumerate(templates):
             signal = await build_signal(info, template)
             logger.info(
@@ -195,38 +179,29 @@ async def run_simulation(mode: str) -> None:
                 f" | size: {min_size}"
             )
 
-            trade_id = await execute_with_fixed_size(
-                signal, min_size, info, exchange, leverage_config, telegram_bot.send,
-                settings.hl_account_address
-            )
-            if trade_id is not None:
-                sim_trade_ids.append(trade_id)
+            if await execute_with_fixed_size(
+                signal, min_size, info, exchange, settings, leverage_config, telegram_bot.send
+            ):
+                opened_coins.add(COIN)
 
             if index < len(templates) - 1:
                 logger.info(f"Waiting {DELAY_BETWEEN_SIGNALS_SECONDS}s before next signal...")
                 await asyncio.sleep(DELAY_BETWEEN_SIGNALS_SECONDS)
 
-        await close_simulation_trades(info, exchange, settings.hl_account_address, telegram_bot.send, sim_trade_ids)
+        await close_simulation_trades(
+            info, exchange, settings.hl_account_address, telegram_bot.send, opened_coins
+        )
 
     logger.info("Simulation complete.")
 
 
-async def close_simulation_trades(info, exchange, address: str, notify, sim_trade_ids: list[int]) -> None:
-    """Close only the positions opened during this simulation run and cancel their TP/SL orders."""
-    from storage.trade_log import fetch_open_trades
-
-    if not sim_trade_ids:
+async def close_simulation_trades(info, exchange, address: str, notify, coins: set[str]) -> None:
+    """Market-close the simulated coins and cancel any leftover trigger orders by live oid."""
+    if not coins:
         logger.info("No simulation trades were opened — nothing to close.")
         return
 
-    all_open = await fetch_open_trades()
-    open_trades = [t for t in all_open if t["id"] in sim_trade_ids]
-    if not open_trades:
-        logger.info("Simulation trades already closed (filled by TP/SL).")
-        return
-
-    coins = list({t["coin"] for t in open_trades})
-    logger.info(f"Auto-closing simulation trades | coins={coins}")
+    logger.info(f"Auto-closing simulation trades | coins={sorted(coins)}")
 
     try:
         all_orders = await asyncio.to_thread(info.frontend_open_orders, address)
@@ -234,17 +209,8 @@ async def close_simulation_trades(info, exchange, address: str, notify, sim_trad
         logger.error(f"Failed to fetch open orders for cleanup: {error}")
         all_orders = []
 
-    total_pnl = 0.0
     lines = []
-
-    for coin in coins:
-        coin_trades = [t for t in open_trades if t["coin"] == coin]
-        side = coin_trades[0]["side"]
-        direction_emoji = "🟢" if side == "LONG" else "🔴"
-
-        # market_close returns None when the net position is already zero
-        # (e.g. a LONG and SHORT of equal size netted each other out on cross margin).
-        # Still cancel the orphaned TP/SL orders and mark DB records closed.
+    for coin in sorted(coins):
         fill_px = None
         try:
             result = await asyncio.to_thread(exchange.market_close, coin, slippage=0.02)
@@ -266,25 +232,13 @@ async def close_simulation_trades(info, exchange, address: str, notify, sim_trad
             except Exception as error:
                 logger.error(f"Failed to cancel TP/SL for {coin}: {error}")
 
-        for trade in coin_trades:
-            entry_px = float(trade["entry_px"])
-            size = float(trade["size"])
-            pnl = (fill_px - entry_px) * size if (fill_px and side == "LONG") else (entry_px - fill_px) * size if fill_px else 0.0
-            total_pnl += pnl
-            await close_trade(trade["id"], pnl, "MANUAL")
-
         if fill_px:
-            lines.append(f"{direction_emoji} {coin} {side} closed @ ${fill_px:,.2f}")
+            lines.append(f"🧹 {coin} closed @ ${fill_px:,.2f}")
         else:
-            lines.append(f"{direction_emoji} {coin} {side} netted to zero — TP/SL cancelled")
+            lines.append(f"🧹 {coin} netted to zero — TP/SL cancelled")
 
-    pnl_sign = "+" if total_pnl >= 0 else ""
-    await notify(
-        f"🧹 Simulation complete — trades closed\n\n"
-        + "\n".join(lines)
-        + f"\n\n💰 Net PnL: {_b(f'{pnl_sign}${total_pnl:,.2f}')}"
-    )
-    logger.info(f"Simulation cleanup complete | total_pnl={total_pnl:.4f}")
+    await notify("🧹 Simulation complete — trades closed\n\n" + "\n".join(lines))
+    logger.info("Simulation cleanup complete")
 
 
 if __name__ == "__main__":
