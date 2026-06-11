@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -157,6 +158,7 @@ async def _validate_and_size(
         return mark_price, 0, 0, leverage, rejection
     is_long = signal["mode"] == "LONG"
     tp_price = float(signal["tp_price"])
+    sl_price = float(signal["sl_price"])
     if is_long and mark_price >= tp_price:
         rejection = f"mark price {mark_price} already at or past TP {tp_price}"
         logger.warning(f"Signal dropped: {rejection} | coin={coin}")
@@ -173,7 +175,6 @@ async def _validate_and_size(
     sz_decimals = _sz_decimals_cache.get(coin, 4)
     if settings.risk_pct is not None:
         entry_price = float(signal["price"])
-        sl_price = float(signal["sl_price"])
         size = calculate_risk_size(
             equity, settings.risk_pct, entry_price, sl_price, batch_size, sz_decimals
         )
@@ -192,15 +193,20 @@ async def _validate_and_size(
     if size <= 0:
         logger.warning(f"Calculated size is zero — skipping | coin={coin}")
         return mark_price, 0, 0, leverage, "zero size"
-    notional = size * mark_price
-    if notional < 10.0:
-        min_size = round(10.0 / mark_price + 10 ** (-sz_decimals), sz_decimals)
+    # Floor the lot so its smallest-notional leg clears Hyperliquid's $10 execution minimum.
+    # A lot's TP and SL share its size (they close the same lot), so the binding leg is the
+    # lowest-priced of entry/TP/SL — for a short that's the TP, for a long the SL, exactly the
+    # legs that get rejected when too small. min() picks the right one without branching.
+    binding_px = min(mark_price, tp_price, sl_price)
+    floor = settings.min_close_notional_usd
+    min_size = math.ceil(floor / binding_px * 10 ** sz_decimals) / 10 ** sz_decimals
+    if size < min_size:
         logger.info(
-            f"Position bumped to $10 min | coin={coin}"
-            f" | original=${notional:.2f} | new_size={min_size}"
+            f"Lot bumped to ${floor:.2f} min-close-notional | coin={coin}"
+            f" | binding_px={binding_px} | old_size={size} | new_size={min_size}"
         )
         size = min_size
-        notional = size * mark_price
+    notional = size * mark_price
     required_margin = notional / leverage
     if required_margin > available_margin:
         rejection = (
