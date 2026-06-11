@@ -37,6 +37,7 @@ def _format_duration(seconds: float) -> str:
 
 
 def log_signal(entry: dict) -> None:
+    entry.setdefault("ts", datetime.now(timezone.utc))
     signal_log.append(entry)
     if len(signal_log) > MAX_SIGNAL_LOG:
         signal_log.pop(0)

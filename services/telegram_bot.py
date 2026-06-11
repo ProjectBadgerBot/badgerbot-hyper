@@ -192,12 +192,32 @@ class TelegramBot:
     ) -> None:
         if not self._is_authorized(update):
             return
+
+        args = context.args or []
+        period = args[0].lower() if args else "week"
+
+        if period == "all":
+            days, label = None, "All Time"
+        elif period == "week":
+            days, label = 7, "Last 7 Days"
+        elif period == "month":
+            days, label = 30, "Last 30 Days"
+        elif period == "day":
+            days, label = 1, "Last 24h"
+        else:
+            await update.message.reply_text("Usage: /history [day|week|month|all]")
+            return
+
+        address = self._settings.hl_account_address
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ms = 0 if days is None else now_ms - days * 24 * 3600 * 1000
         fills = await asyncio.to_thread(
-            self._info.user_fills, self._settings.hl_account_address
+            self._info.user_fills_by_time, address, start_ms, now_ms
         )
+
         closes = [f for f in reversed(fills) if "Close" in f.get("dir", "")][:10]
         if not closes:
-            await update.message.reply_text("No closed trades yet.")
+            await update.message.reply_text(f"No closed trades — {label}.")
             return
         lines = []
         for f in closes:
@@ -205,11 +225,15 @@ class TelegramBot:
             exit_px = float(f.get("px", 0))
             pnl = float(f.get("closedPnl", 0)) - float(f.get("fee", 0))
             pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+            when = datetime.fromtimestamp(
+                f.get("time", 0) / 1000, timezone.utc
+            ).strftime("%b %d %H:%M")
             lines.append(
-                f"{f.get('coin')} {side} | Exit {_b(f'${exit_px:,.2f}')} | PnL {_b(pnl_str)}"
+                f"{_b(when)} | {f.get('coin')} {side} | "
+                f"Exit {_b(f'${exit_px:,.2f}')} | PnL {_b(pnl_str)}"
             )
         await update.message.reply_text(
-            "Recent closes:\n" + "\n".join(lines), parse_mode="HTML"
+            f"📜 Closed Trades — {_b(label)}\n\n" + "\n".join(lines), parse_mode="HTML"
         )
 
     async def _cmd_position(
@@ -485,21 +509,23 @@ class TelegramBot:
             return
 
         args = context.args or []
-        period = args[0].lower() if args else "week"
+        period = args[0].lower() if args else "all"
 
-        if period == "week":
+        if period == "all":
+            days, label = None, "All Time"
+        elif period == "week":
             days, label = 7, "Last 7 Days"
         elif period == "month":
             days, label = 30, "Last 30 Days"
         elif period == "day":
             days, label = 1, "Last 24h"
         else:
-            await update.message.reply_text("Usage: /stats [day|week|month]")
+            await update.message.reply_text("Usage: /stats [day|week|month|all]")
             return
 
         address = self._settings.hl_account_address
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        start_ms = now_ms - days * 24 * 3600 * 1000
+        start_ms = 0 if days is None else now_ms - days * 24 * 3600 * 1000
         fills = await asyncio.to_thread(
             self._info.user_fills_by_time, address, start_ms, now_ms
         )
@@ -566,8 +592,10 @@ class TelegramBot:
             else:
                 icon = "❌"
                 detail = _b(entry.get("reason", ""))
+            ts = entry.get("ts")
+            when = f"{ts:%b %d %H:%M} — " if isinstance(ts, datetime) else ""
             lines.append(
-                f"{icon} {entry.get('coin', '?')} {entry.get('side', '?')} — {detail}"
+                f"{icon} {when}{entry.get('coin', '?')} {entry.get('side', '?')} — {detail}"
             )
         await update.message.reply_text(
             f"📡 Signal Log (last {_b(len(lines))})\n\n" + "\n".join(lines),
@@ -584,11 +612,11 @@ class TelegramBot:
             "📋 /position — live positions with their TP/SL orders\n"
             "⏸ /pause — stop processing signals\n"
             "▶️ /resume — resume signals\n"
-            "📜 /history — last 10 closed fills\n"
+            "📜 /history — recent closed trades (or /history day|month|all)\n"
             "🔒 /close <COIN|all> — close a coin's position or all positions\n"
             "⚠️ /unprotected — positions missing full TP/SL coverage on HL\n"
             "🚨 /unprotected_close — close positions missing full coverage\n"
-            "📈 /stats — performance (or /stats day, /stats month)\n"
+            "📈 /stats — all-time performance (or /stats day|week|month)\n"
             "📡 /signal — recent signal log (filled, rejected, errors)\n"
             "❓ /help — this message"
         )
@@ -637,8 +665,8 @@ class TelegramBot:
                 [
                     BotCommand("status", "📊 Open positions or balance"),
                     BotCommand("position", "📋 Positions with live TP/SL"),
-                    BotCommand("history", "📜 Last 10 closed fills"),
-                    BotCommand("stats", "📈 Performance dashboard"),
+                    BotCommand("history", "📜 Recent closed trades"),
+                    BotCommand("stats", "📈 All-time performance"),
                     BotCommand("signal", "📡 Recent signal log"),
                     BotCommand("close", "🔒 Close a coin or all positions"),
                     BotCommand("unprotected", "⚠️ Positions missing TP/SL coverage"),
