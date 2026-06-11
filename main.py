@@ -10,11 +10,11 @@ from hyperliquid.utils import constants
 
 from config.settings import Settings, load_settings
 from services.position_monitor import run_position_monitor
+from services.reporting import run_daily_report
 from services.signal_consumer import connect_and_listen
 from services.updater import run_updater
 from services.telegram_bot import BotState, TelegramBot
 from services.trade_executor import build_exchange, load_leverage_config, make_signal_handler, safe_spot_meta
-from storage.trade_log import fetch_open_trades, init_trade_log, insert_trade, repair_trade_tpsl, update_trade_oids, update_trade_status
 
 LOGS_DIR = Path(__file__).parent / "logs"
 
@@ -77,178 +77,6 @@ def format_open_positions(asset_positions: list) -> str:
     return f"{len(lines)} open position(s):\n" + "\n".join(lines)
 
 
-def _extract_tpsl_for_coin(all_orders: list, coin: str, logger: logging.Logger) -> tuple[float, float]:
-    tp_px, _, sl_px, _ = _extract_tpsl_with_oids_for_coin(all_orders, coin, logger)
-    return tp_px, sl_px
-
-
-def _extract_tpsl_with_oids_for_coin(
-    all_orders: list, coin: str, logger: logging.Logger
-) -> tuple[float, str, float, str]:
-    """Return (tp_px, tp_oid, sl_px, sl_oid) for reconciliation of recovered positions.
-    Missing values come back as 0.0 / "" so insert_trade's defaults kick in."""
-    coin_triggers = [o for o in all_orders if o.get("coin") == coin and o.get("isTrigger")]
-    tp_order = next(
-        (o for o in coin_triggers if "profit" in o.get("orderType", "").lower()),
-        None,
-    )
-    sl_order = next(
-        (o for o in coin_triggers if "stop" in o.get("orderType", "").lower()),
-        None,
-    )
-    tp_px = float(tp_order["triggerPx"]) if tp_order else 0.0
-    tp_oid = str(tp_order["oid"]) if tp_order and tp_order.get("oid") is not None else ""
-    sl_px = float(sl_order["triggerPx"]) if sl_order else 0.0
-    sl_oid = str(sl_order["oid"]) if sl_order and sl_order.get("oid") is not None else ""
-    return tp_px, tp_oid, sl_px, sl_oid
-
-
-async def _fetch_all_orders(info: Info, settings: Settings, logger: logging.Logger) -> list:
-    try:
-        raw_orders = await asyncio.to_thread(
-            info.frontend_open_orders, settings.hl_account_address
-        )
-    except Exception as error:
-        logger.error(f"Reconciliation: failed to fetch open orders: {error}")
-        return []
-    all_orders = []
-    for order in raw_orders:
-        all_orders.append(order)
-        all_orders.extend(order.get("children", []))
-    return all_orders
-
-
-async def _reconcile_orphaned_positions(
-    info: Info, settings: Settings, asset_positions: list, logger: logging.Logger
-) -> None:
-    open_trades = await fetch_open_trades()
-    db_coins = {t["coin"] for t in open_trades}
-
-    hl_positions = {}
-    for p in asset_positions:
-        pos = p.get("position", {})
-        coin = pos.get("coin", "")
-        if coin and float(pos.get("szi", 0)) != 0:
-            hl_positions[coin] = pos
-
-    orphaned = {c: p for c, p in hl_positions.items() if c not in db_coins}
-    unprotected = [t for t in open_trades if t["status"] == "UNPROTECTED"]
-    missing_oids = [t for t in open_trades if not t.get("tp_oid") or not t.get("sl_oid")]
-
-    if not orphaned and not unprotected and not missing_oids:
-        return
-
-    all_orders = await _fetch_all_orders(info, settings, logger)
-
-    for coin, pos in orphaned.items():
-        szi = float(pos["szi"])
-        side = "LONG" if szi > 0 else "SHORT"
-        size = abs(szi)
-        entry_px = float(pos.get("entryPx") or 0)
-        tp_px, tp_oid, sl_px, sl_oid = _extract_tpsl_with_oids_for_coin(
-            all_orders, coin, logger
-        )
-
-        trade_id = await insert_trade(
-            coin, side, size, entry_px, tp_px, sl_px,
-            tp_order_id=tp_oid, sl_order_id=sl_oid,
-        )
-
-        if tp_px == 0.0 or sl_px == 0.0:
-            await update_trade_status(trade_id, "UNPROTECTED")
-            logger.warning(
-                f"Recovered untracked position: {coin} {side} {size} @ ${entry_px}"
-                f" | TP/SL not found — marked UNPROTECTED"
-            )
-        else:
-            logger.info(
-                f"Recovered untracked position: {coin} {side} {size} @ ${entry_px}"
-                f" | TP: ${tp_px} | SL: ${sl_px}"
-            )
-
-    for trade in unprotected:
-        coin = trade["coin"]
-        tp_px, tp_oid, sl_px, sl_oid = _extract_tpsl_with_oids_for_coin(
-            all_orders, coin, logger
-        )
-        if tp_px == 0.0 or sl_px == 0.0:
-            logger.warning(f"UNPROTECTED trade id={trade['id']} {coin} — TP/SL still not found on HL")
-            continue
-        await repair_trade_tpsl(trade["id"], tp_px, sl_px)
-        await update_trade_oids(trade["id"], tp_oid or None, sl_oid or None)
-        logger.info(
-            f"Repaired UNPROTECTED trade id={trade['id']} {coin}"
-            f" | TP: ${tp_px} | SL: ${sl_px}"
-        )
-
-    # Backfill OIDs for any OPEN trade that's missing tp_oid or sl_oid. Legacy rows
-    # written before the OID-lookup fix have NULL oids; without this step, the
-    # cancellation/matching paths fall back to fragile heuristics. The 2026-05-17
-    # incident was caused by that fallback running against rows with NULL oids.
-    await _backfill_missing_oids(open_trades, all_orders, logger)
-
-
-def _greedy_assign(rows: list[dict], orders: list, coin: str,
-                   price_field: str, kind: str) -> dict[int, str]:
-    """1:1 greedy assignment of DB rows to HL trigger orders by (size, price)
-    proximity. `kind` is "profit" or "stop" to filter order types."""
-    candidates = [
-        o for o in orders
-        if o.get("coin") == coin and o.get("triggerPx")
-        and kind in o.get("orderType", "").lower()
-    ]
-    pairs = []
-    for r in rows:
-        target = float(r[price_field]) if r[price_field] is not None else 0
-        size = float(r["size"])
-        if target <= 0 or size <= 0:
-            continue
-        for o in candidates:
-            try:
-                o_px = float(o["triggerPx"])
-                o_sz = float(o.get("sz", 0))
-            except (TypeError, ValueError):
-                continue
-            if abs(o_px - target) / target >= 0.001 or abs(o_sz - size) / size >= 0.01:
-                continue
-            pairs.append((abs(o_px - target), r["id"], o["oid"]))
-    pairs.sort()
-    used_rows, used_oids, out = set(), set(), {}
-    for _, row_id, oid in pairs:
-        if row_id in used_rows or oid in used_oids:
-            continue
-        out[row_id] = str(oid)
-        used_rows.add(row_id)
-        used_oids.add(oid)
-    return out
-
-
-async def _backfill_missing_oids(open_trades: list[dict], all_orders: list, logger: logging.Logger) -> None:
-    missing = [t for t in open_trades if not t.get("tp_oid") or not t.get("sl_oid")]
-    if not missing:
-        return
-    by_coin: dict[str, list[dict]] = {}
-    for t in missing:
-        by_coin.setdefault(t["coin"], []).append(t)
-    for coin, rows in by_coin.items():
-        tp_map = _greedy_assign(rows, all_orders, coin, "tp_px", "profit")
-        sl_map = _greedy_assign(rows, all_orders, coin, "sl_px", "stop")
-        for t in rows:
-            new_tp = t.get("tp_oid") or tp_map.get(t["id"])
-            new_sl = t.get("sl_oid") or sl_map.get(t["id"])
-            if (new_tp and new_tp != t.get("tp_oid")) or (new_sl and new_sl != t.get("sl_oid")):
-                await update_trade_oids(t["id"], new_tp, new_sl)
-                logger.info(
-                    f"Backfilled OIDs | trade={t['id']} {coin}"
-                    f" | tp_oid={new_tp or 'MISSING'} sl_oid={new_sl or 'MISSING'}"
-                )
-            elif not new_tp or not new_sl:
-                logger.warning(
-                    f"Could not backfill OIDs | trade={t['id']} {coin}"
-                    f" | tp_oid={new_tp or 'MISSING'} sl_oid={new_sl or 'MISSING'}"
-                )
-
-
 async def run_startup_check(settings: Settings, info: Info, logger: logging.Logger) -> None:
     logger.info(f"Connecting to Hyperliquid MAINNET ({constants.MAINNET_API_URL})")
 
@@ -270,10 +98,6 @@ async def run_startup_check(settings: Settings, info: Info, logger: logging.Logg
         f"Account: {settings.hl_account_address} | Equity: ${account_equity:,.2f}"
     )
     logger.info(format_open_positions(asset_positions))
-
-    await init_trade_log()
-    logger.info("Trade log initialized")
-    await _reconcile_orphaned_positions(info, settings, asset_positions, logger)
     logger.info("All services ready. Starting loop...")
 
 
@@ -317,6 +141,10 @@ async def main() -> None:
         ("position_monitor", asyncio.create_task(
             run_position_monitor(info, settings, telegram_bot.send, stop_event, exchange),
             name="position_monitor",
+        )),
+        ("daily_report", asyncio.create_task(
+            run_daily_report(info, settings, telegram_bot.send, stop_event),
+            name="daily_report",
         )),
     ]
 

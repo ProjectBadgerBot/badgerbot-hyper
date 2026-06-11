@@ -4,14 +4,8 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 1
+    # Stateless: Hyperliquid is the single source of truth, no local DB/disk needed.
     envVars:
-      # Database — persisted across deploys via the /data disk
-      - key: HYPERBOT_DB_PATH
-        value: /data/hyperbot.db
       # Network — switch to false when ready for mainnet
       - key: HL_USE_TESTNET
         value: "true"

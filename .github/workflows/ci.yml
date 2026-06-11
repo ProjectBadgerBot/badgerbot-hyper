@@ -22,6 +22,9 @@ jobs:
           python -c "from config.settings import Settings, load_settings"
           python -c "from services.trade_executor import execute_signal, build_exchange"
           python -c "from services.signal_consumer import parse_signal, validate_signal"
-          python -c "from services.position_monitor import run_position_monitor"
+          python -c "from services.position_monitor import run_position_monitor, find_unprotected_coins"
           python -c "from services.telegram_bot import TelegramBot, BotState"
-          python -c "from storage.trade_log import insert_trade, update_trade_status"
+          python -c "from services.reporting import run_daily_report, build_daily_report"
+
+      - name: Run tests
+        run: pip install pytest && pytest -q

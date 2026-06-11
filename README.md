@@ -130,7 +130,6 @@ In your Render service, go to **Environment** and add each variable.
 
 | Variable | Value |
 |---|---|
-| `HYPERBOT_DB_PATH` | `/data/hyperbot.db` |
 | `HL_ACCOUNT_ADDRESS` | Your main wallet address |
 | `HL_API_PRIVATE_KEY` | Your API wallet private key |
 | `BADGERBOT_API_KEY` | Your BadgerBot API key |
@@ -326,8 +325,9 @@ systemctl restart badgerbot          # root
 | `RISK_PCT` | No | — | Max loss per trade at SL as fraction of equity — overrides both above |
 | `MAX_SIGNAL_AGE_SECONDS` | No | `60` | Drop signals older than this |
 | `MAX_PRICE_DEVIATION_PCT` | No | `0.01` | Drop signal if mark price moved more than 1% |
-| `POSITION_POLL_INTERVAL_SECONDS` | No | `15` | How often to check for filled TP/SL orders |
-| `HYPERBOT_DB_PATH` | No | `./hyperbot.db` | Path to the trade database (set to `/data/hyperbot.db` on Render) |
+| `POSITION_POLL_INTERVAL_SECONDS` | No | `15` | How often to reconcile TP/SL coverage against the live position |
+| `REPORT_HOUR` | No | `8` | Hour of day to send the daily report |
+| `REPORT_TZ` | No | `Europe/Berlin` | Timezone for the daily report |
 | `ALGORITHMS` | No | `Ethereum Main` | Comma-separated list of algorithms this bot should act on — see [Algorithms](#algorithms) |
 
 ---
@@ -398,13 +398,13 @@ If `ALGORITHMS` is omitted, the bot defaults to `Ethereum Main`. A signal that c
 | Command | Description |
 |---|---|
 | `/status` | Open positions (size, entry, leverage, uPnL) or available balance if flat |
-| `/position` | Individual trade records with TP/SL prices, funding, and liquidation price |
+| `/position` | Live positions with their TP/SL trigger orders, funding, and liquidation price |
 | `/pause` | Stop processing incoming signals (open positions are unaffected) |
 | `/resume` | Resume signal processing |
-| `/history` | Last 10 closed trades with net PnL after fees |
-| `/close <N\|all>` | Close trade number N or all open positions |
-| `/stats` | Performance dashboard: win rate, avg win/loss, best/worst trade, avg hold time |
-| `/stats week` | Same, filtered to last 7 days |
+| `/history` | Last 10 closed fills with net PnL after fees |
+| `/close <COIN\|all>` | Close a coin's position (or all positions) and cancel its TP/SL orders |
+| `/stats` | Performance dashboard: win rate, avg win/loss, best/worst close (last 7 days) |
+| `/stats day` | Same, filtered to last 24h |
 | `/stats month` | Same, filtered to last 30 days |
 | `/signal` | Recent signal log: filled, rejected, and errored entries |
 | `/help` | List all commands |

@@ -17,7 +17,6 @@ INITIAL_RECONNECT_DELAY_SECONDS = 1
 MAX_RECONNECT_DELAY_SECONDS = 60
 OFFLINE_ALERT_THRESHOLD_SECONDS = 300
 OFFLINE_ALERT_COOLDOWN_SECONDS = 86400
-NO_SIGNAL_REMINDER_SECONDS = 86400
 
 SignalHandler = Callable[..., Awaitable[None]]
 
@@ -29,10 +28,6 @@ _buffer_task: asyncio.Task | None = None
 signal_log: list[dict] = []
 MAX_SIGNAL_LOG = 50
 
-# Tracks last signal timestamp for daily reminder
-last_signal_at: float = 0.0
-
-
 def _format_duration(seconds: float) -> str:
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
@@ -42,6 +37,7 @@ def _format_duration(seconds: float) -> str:
 
 
 def log_signal(entry: dict) -> None:
+    entry.setdefault("ts", datetime.now(timezone.utc))
     signal_log.append(entry)
     if len(signal_log) > MAX_SIGNAL_LOG:
         signal_log.pop(0)
@@ -173,8 +169,6 @@ async def _listen(
                     f" | allowed={settings.algorithms}"
                 )
                 continue
-            global last_signal_at
-            last_signal_at = time.monotonic()
             logger.info(
                 f"Signal received: {signal['coin_symbol']} {signal['mode']}"
                 f" @ {signal['price']} | TP: {signal['tp_price']} | SL: {signal['sl_price']}"
@@ -183,27 +177,6 @@ async def _listen(
                 await _buffer_signal(signal, signal_handler)
             else:
                 await signal_handler(signal)
-
-
-async def _no_signal_reminder(stop_event: asyncio.Event, notify) -> None:
-    global last_signal_at
-    last_signal_at = time.monotonic()
-    while not stop_event.is_set():
-        try:
-            await asyncio.sleep(3600)
-        except asyncio.CancelledError:
-            return
-        if stop_event.is_set():
-            return
-        elapsed = time.monotonic() - last_signal_at
-        if elapsed >= NO_SIGNAL_REMINDER_SECONDS and notify:
-            last_signal_str = _format_duration(elapsed)
-            await notify(
-                f"📡 No signals received in the last 24h\n\n"
-                f"Connection: <code>active</code>\n"
-                f"Last signal: <code>{last_signal_str} ago</code>"
-            )
-            last_signal_at = time.monotonic()
 
 
 async def connect_and_listen(
@@ -217,70 +190,55 @@ async def connect_and_listen(
     last_message_ref: list[float] = [time.monotonic()]
     last_offline_alert_at: float = 0.0
 
-    reminder_task = asyncio.create_task(_no_signal_reminder(stop_event, notify))
-
-    try:
-        while not stop_event.is_set():
-            try:
-                last_message_ref[0] = time.monotonic()
-                reconnect_delay = INITIAL_RECONNECT_DELAY_SECONDS
-                listen_task = asyncio.create_task(
-                    _listen(websocket_url, signal_handler, settings, last_message_ref)
-                )
-                stop_task = asyncio.create_task(stop_event.wait())
-                done, pending = await asyncio.wait(
-                    {listen_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                if stop_task in done:
-                    break
-                if not listen_task.cancelled() and listen_task.exception():
-                    raise listen_task.exception()
-            except ConnectionClosed as error:
-                logger.warning(f"WebSocket disconnected: {error}")
-            except Exception as error:
-                logger.error(f"WebSocket error: {error}")
-
-            if stop_event.is_set():
-                break
-
-            since_last_msg = time.monotonic() - last_message_ref[0]
-            since_last_alert = time.monotonic() - last_offline_alert_at
-
-            if since_last_msg >= OFFLINE_ALERT_THRESHOLD_SECONDS:
-                if since_last_alert >= OFFLINE_ALERT_COOLDOWN_SECONDS or last_offline_alert_at == 0:
-                    duration_str = _format_duration(since_last_msg)
-                    msg = (
-                        f"📡 Signal feed offline\n\n"
-                        f"Last message: <code>{duration_str} ago</code>\n"
-                        f"Reconnecting..."
-                    )
-                    logger.error(msg)
-                    if notify:
-                        await notify(msg)
-                    last_offline_alert_at = time.monotonic()
-            else:
-                logger.warning(f"Reconnecting in {reconnect_delay}s...")
-
-            # Send reconnected notice if we had previously alerted
-            if last_offline_alert_at > 0:
-                try:
-                    await asyncio.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY_SECONDS)
-                    continue
-                except asyncio.CancelledError:
-                    return
-
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY_SECONDS)
-    finally:
-        reminder_task.cancel()
+    while not stop_event.is_set():
         try:
-            await reminder_task
+            last_message_ref[0] = time.monotonic()
+            reconnect_delay = INITIAL_RECONNECT_DELAY_SECONDS
+            listen_task = asyncio.create_task(
+                _listen(websocket_url, signal_handler, settings, last_message_ref)
+            )
+            stop_task = asyncio.create_task(stop_event.wait())
+            done, pending = await asyncio.wait(
+                {listen_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if stop_task in done:
+                break
+            if not listen_task.cancelled() and listen_task.exception():
+                raise listen_task.exception()
+        except ConnectionClosed as error:
+            logger.warning(f"WebSocket disconnected: {error}")
+        except Exception as error:
+            logger.error(f"WebSocket error: {error}")
+
+        if stop_event.is_set():
+            break
+
+        since_last_msg = time.monotonic() - last_message_ref[0]
+        since_last_alert = time.monotonic() - last_offline_alert_at
+
+        if since_last_msg >= OFFLINE_ALERT_THRESHOLD_SECONDS:
+            if since_last_alert >= OFFLINE_ALERT_COOLDOWN_SECONDS or last_offline_alert_at == 0:
+                duration_str = _format_duration(since_last_msg)
+                msg = (
+                    f"📡 Signal feed offline\n\n"
+                    f"Last message: <code>{duration_str} ago</code>\n"
+                    f"Reconnecting..."
+                )
+                logger.error(msg)
+                if notify:
+                    await notify(msg)
+                last_offline_alert_at = time.monotonic()
+        else:
+            logger.warning(f"Reconnecting in {reconnect_delay}s...")
+
+        try:
+            await asyncio.sleep(reconnect_delay)
         except asyncio.CancelledError:
-            pass
+            return
+        reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY_SECONDS)

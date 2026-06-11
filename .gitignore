@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.db
 logs/*.log
+logs/*.log.*
 .venv/
 .DS_Store
 tests/

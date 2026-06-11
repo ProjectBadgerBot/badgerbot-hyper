@@ -1,6 +1,6 @@
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -28,10 +28,15 @@ class Settings:
     max_price_deviation_pct: float
     telegram_bot_token: str
     telegram_authorized_user_id: int
-    position_poll_interval_seconds: int
-    algorithms: list[str]
-    auto_update_enabled: bool
-    auto_update_interval_hours: int
+    position_poll_interval_seconds: int = 15
+    # Hyperliquid rejects orders worth less than $10 at execution. We floor every lot so
+    # its smallest-notional leg (entry, TP, or SL) clears this with a buffer above $10.
+    min_close_notional_usd: float = 11.0
+    algorithms: list[str] = field(default_factory=lambda: list(DEFAULT_ALGORITHMS))
+    auto_update_enabled: bool = True
+    auto_update_interval_hours: int = 24
+    report_hour: int = 8
+    report_tz: str = "Europe/Berlin"
 
 
 def _parse_algorithms(raw: str | None) -> list[str]:
@@ -65,7 +70,10 @@ def load_settings() -> Settings:
         telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
         telegram_authorized_user_id=int(os.environ["TELEGRAM_AUTHORIZED_USER_ID"]),
         position_poll_interval_seconds=int(os.getenv("POSITION_POLL_INTERVAL_SECONDS", "15")),
+        min_close_notional_usd=float(os.getenv("MIN_CLOSE_NOTIONAL_USD", "11.0")),
         algorithms=_parse_algorithms(os.getenv("ALGORITHMS")),
         auto_update_enabled=os.getenv("AUTO_UPDATE_ENABLED", "true").lower() == "true",
         auto_update_interval_hours=int(os.getenv("AUTO_UPDATE_INTERVAL_HOURS", "24")),
+        report_hour=int(os.getenv("REPORT_HOUR", "8")),
+        report_tz=os.getenv("REPORT_TZ", "Europe/Berlin"),
     )
