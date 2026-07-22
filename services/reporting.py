@@ -22,17 +22,16 @@ def _seconds_until_next(hour: int, tz: ZoneInfo) -> float:
 
 
 def _account_snapshot(info: Info, address: str) -> tuple[float, float]:
-    """(open position value, margin left to spend)."""
+    """(open position value, margin left to spend).
+
+    Perps wallet only — spot USDC cannot back a perp position, so counting it here
+    would overstate what is actually left to trade. See _fetch_account_state in
+    trade_executor.
+    """
     user_state = info.user_state(address)
-    spot_state = info.spot_user_state(address)
     margin = user_state.get("marginSummary", {})
     margin_used = float(margin.get("totalMarginUsed", 0))
-    perps_equity = float(margin.get("accountValue", 0))
-    spot_usdc = next(
-        (float(b["total"]) for b in spot_state.get("balances", []) if b["coin"] == "USDC"),
-        0.0,
-    )
-    account_value = max(perps_equity, spot_usdc)
+    account_value = float(margin.get("accountValue", 0))
     open_value = sum(
         abs(float(ap.get("position", {}).get("positionValue", 0)))
         for ap in user_state.get("assetPositions", [])

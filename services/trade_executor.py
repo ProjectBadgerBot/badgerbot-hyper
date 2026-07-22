@@ -56,23 +56,41 @@ async def ensure_sz_decimals_cached(info: Info) -> None:
         _sz_decimals_cache = await asyncio.to_thread(_fetch_sz_decimals, info)
 
 
-def _fetch_account_state(info: Info, address: str) -> tuple[float, float]:
-    # Returns (equity, available_margin). Available margin is equity minus margin already
-    # locked by open positions — what's actually free to back a new entry.
-    # Unified accounts: spot USDC is the total collateral pool; perps equity is only the
-    # margin portion. Standard accounts: perps equity is the full pool; spot USDC is 0.
-    # max() returns the correct total for both account types.
-    user_state = info.user_state(address)
-    margin = user_state.get("marginSummary", {})
-    perps_equity = float(margin.get("accountValue", 0))
-    margin_used = float(margin.get("totalMarginUsed", 0))
+# Perps equity at or below this counts as empty — a spot transfer leaves dust behind,
+# which is enough to make a plain `> 0` check pass.
+MIN_EQUITY_USD = 0.01
+
+
+def has_perps_equity(equity: float) -> bool:
+    """True when the perps wallet holds more than dust."""
+    return equity > MIN_EQUITY_USD
+
+
+def fetch_spot_usdc(info: Info, address: str) -> float:
+    """USDC held in the spot wallet. Reported only — it cannot back a perp position."""
     spot_state = info.spot_user_state(address)
-    spot_usdc = 0.0
     for balance in spot_state.get("balances", []):
         if balance["coin"] == "USDC":
-            spot_usdc = float(balance["total"])
-            break
-    equity = max(perps_equity, spot_usdc)
+            return float(balance["total"])
+    return 0.0
+
+
+def _fetch_account_state(info: Info, address: str) -> tuple[float, float]:
+    """Returns (equity, available_margin) for the PERPS wallet.
+
+    Available margin is equity minus margin already locked by open positions — what's
+    actually free to back a new entry.
+
+    Spot and perps are separate balances on Hyperliquid: USDC sitting in spot cannot
+    collateralise a perp until it is transferred across. This previously returned
+    max(perps_equity, spot_usdc), which on an account holding most of its USDC in spot
+    sized every trade against money the perps engine cannot touch — and subtracted
+    perps margin_used from a spot balance to get "available", mixing the two pools.
+    """
+    user_state = info.user_state(address)
+    margin = user_state.get("marginSummary", {})
+    equity = float(margin.get("accountValue", 0))
+    margin_used = float(margin.get("totalMarginUsed", 0))
     return equity, equity - margin_used
 
 
@@ -168,7 +186,16 @@ async def _validate_and_size(
         logger.warning(f"Signal dropped: {rejection} | coin={coin}")
         return mark_price, 0, 0, leverage, rejection
     equity, available_margin = await fetch_account_state(info, settings.hl_account_address)
-    if equity <= 0:
+    if not has_perps_equity(equity):
+        # Distinguish "no money" from "money in the wrong wallet" — the second is a
+        # one-transfer fix, and reporting a bare "zero equity" hides that.
+        spot_usdc = await asyncio.to_thread(
+            fetch_spot_usdc, info, settings.hl_account_address
+        )
+        if spot_usdc > 0:
+            rejection = "no perps collateral — USDC is in the spot wallet"
+            logger.error(f"Signal dropped: {rejection} | coin={coin}")
+            return mark_price, 0, 0, leverage, rejection
         logger.error(f"Account equity is zero — skipping | coin={coin}")
         return mark_price, 0, 0, leverage, "zero equity"
     await ensure_sz_decimals_cached(info)

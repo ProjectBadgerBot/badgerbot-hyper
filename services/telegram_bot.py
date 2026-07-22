@@ -10,12 +10,31 @@ from config.settings import Settings
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from services.signal_consumer import signal_log
+from services.trade_executor import has_perps_equity
 
 logger = logging.getLogger("TelegramBot")
 
 
 def _b(text) -> str:
     return f"<code>{text}</code>"
+
+
+def format_equity_block(equity: float | None, spot_usdc: float) -> str:
+    """Equity lines for the startup message.
+
+    Each value is wrapped in <code> exactly once — Telegram rejects nested identical
+    tags, and send() only logs the resulting BadRequest, so a nesting mistake silently
+    swallows the whole message rather than failing loudly.
+    """
+    if equity is None:
+        return f"💰 Equity: {_b('N/A')}"
+
+    lines = [f"💰 Equity: {_b(f'${equity:,.2f}')} (perps)"]
+    if spot_usdc > 0:
+        lines.append(f"💤 Spot USDC (not tradeable): {_b(f'${spot_usdc:,.2f}')}")
+    if not has_perps_equity(equity) and spot_usdc > 0:
+        lines.append("⚠️ NO PERPS COLLATERAL — trades cannot open.")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -242,11 +261,8 @@ class TelegramBot:
         if not self._is_authorized(update):
             return
 
-        user_state, spot_state, raw_orders = await asyncio.gather(
+        user_state, raw_orders = await asyncio.gather(
             asyncio.to_thread(self._info.user_state, self._settings.hl_account_address),
-            asyncio.to_thread(
-                self._info.spot_user_state, self._settings.hl_account_address
-            ),
             asyncio.to_thread(
                 self._info.frontend_open_orders, self._settings.hl_account_address
             ),
@@ -270,18 +286,11 @@ class TelegramBot:
                 if item.get("triggerPx") and item.get("coin"):
                     triggers.setdefault(item["coin"], []).append(item)
 
+        # Perps wallet only. This previously took max(perps, spot) and subtracted perps
+        # margin_used from it, mixing two separate pools.
         margin = user_state.get("marginSummary", {})
         margin_used = float(margin.get("totalMarginUsed", 0))
-        perps_equity = float(margin.get("accountValue", 0))
-        spot_usdc = next(
-            (
-                float(b["total"])
-                for b in spot_state.get("balances", [])
-                if b["coin"] == "USDC"
-            ),
-            0.0,
-        )
-        account_value = max(perps_equity, spot_usdc)
+        account_value = float(margin.get("accountValue", 0))
         available = account_value - margin_used
         margin_pct = (margin_used / account_value * 100) if account_value > 0 else 0
 
@@ -622,6 +631,8 @@ class TelegramBot:
         )
 
     async def _send_startup_message(self) -> None:
+        from services.trade_executor import fetch_spot_usdc
+
         address = self._settings.hl_account_address
         short_address = f"{address[:6]}...{address[-4:]}"
 
@@ -632,26 +643,24 @@ class TelegramBot:
         else:
             sizing = f"{self._settings.position_size_pct * 100:.0f}% equity per trade"
 
+        # Perps equity is what trades are sized against; spot USDC is shown separately so
+        # idle collateral in the wrong wallet is visible instead of silently inflating the
+        # headline number. See _fetch_account_state in trade_executor.
         try:
             user_state = await asyncio.to_thread(self._info.user_state, address)
             margin_summary = user_state.get("marginSummary", {})
-            perps_equity = float(margin_summary.get("accountValue", 0))
-            spot_state = await asyncio.to_thread(self._info.spot_user_state, address)
-            spot_usdc = next(
-                (float(b["total"]) for b in spot_state.get("balances", []) if b["coin"] == "USDC"),
-                0.0,
-            )
-            equity = max(perps_equity, spot_usdc)
-            equity_str = f"${equity:,.2f}"
-        except Exception:
-            equity_str = "N/A"
+            equity = float(margin_summary.get("accountValue", 0))
+            spot_usdc = await asyncio.to_thread(fetch_spot_usdc, self._info, address)
+        except Exception as error:
+            logger.error(f"Startup equity fetch failed: {error}")
+            equity, spot_usdc = None, 0.0
 
         algorithms_str = ", ".join(self._settings.algorithms)
 
         await self.send(
             f"🟢 BadgerBot Hyper started\n\n"
             f"👛 Account: {_b(short_address)}\n"
-            f"💰 Equity: {_b(equity_str)}\n"
+            f"{format_equity_block(equity, spot_usdc)}\n"
             f"📐 Sizing: {_b(sizing)}\n"
             f"🧠 Algorithms: {_b(algorithms_str)}\n"
             f"   Double-check spelling against your subscription —"
