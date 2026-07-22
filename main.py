@@ -14,7 +14,7 @@ from services.reporting import run_daily_report
 from services.signal_consumer import connect_and_listen
 from services.updater import run_updater
 from services.telegram_bot import BotState, TelegramBot
-from services.trade_executor import build_exchange, load_leverage_config, make_signal_handler, safe_spot_meta
+from services.trade_executor import build_exchange, has_perps_equity, load_leverage_config, make_signal_handler, safe_spot_meta
 
 LOGS_DIR = Path(__file__).parent / "logs"
 
@@ -56,11 +56,13 @@ def fetch_spot_usdc_balance(info: Info, address: str) -> float:
     return 0.0
 
 
-def resolve_account_equity(perps_equity: float, info: Info, address: str) -> float:
-    # Unified accounts keep USDC in spot; marginSummary shows $0 until active perps positions exist
-    if perps_equity > 0:
-        return perps_equity
-    return fetch_spot_usdc_balance(info, address)
+def format_startup_equity(perps_equity: float, spot_usdc: float) -> str:
+    """Startup equity line. Perps equity is what trades are sized against; spot USDC is
+    called out separately because it cannot collateralise a perp until transferred."""
+    line = f"${perps_equity:,.2f} (perps)"
+    if spot_usdc > 0:
+        line += f" | ${spot_usdc:,.2f} USDC in spot — NOT tradeable until transferred"
+    return line
 
 
 def format_open_positions(asset_positions: list) -> str:
@@ -88,15 +90,21 @@ async def run_startup_check(settings: Settings, info: Info, logger: logging.Logg
 
     margin_summary = user_state.get("marginSummary", {})
     perps_equity = float(margin_summary.get("accountValue", 0))
-    account_equity = await asyncio.to_thread(
-        resolve_account_equity, perps_equity, info, settings.hl_account_address
+    spot_usdc = await asyncio.to_thread(
+        fetch_spot_usdc_balance, info, settings.hl_account_address
     )
     asset_positions = user_state.get("assetPositions", [])
 
     logger.info("Connected to Hyperliquid MAINNET")
     logger.info(
-        f"Account: {settings.hl_account_address} | Equity: ${account_equity:,.2f}"
+        f"Account: {settings.hl_account_address}"
+        f" | Equity: {format_startup_equity(perps_equity, spot_usdc)}"
     )
+    if not has_perps_equity(perps_equity) and spot_usdc > 0:
+        logger.warning(
+            f"No perps collateral — ${spot_usdc:,.2f} USDC is in the spot wallet."
+            f" Trades cannot open."
+        )
     logger.info(format_open_positions(asset_positions))
     logger.info("All services ready. Starting loop...")
 
