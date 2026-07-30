@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -64,6 +65,48 @@ MIN_EQUITY_USD = 0.01
 def has_perps_equity(equity: float) -> bool:
     """True when the perps wallet holds more than dust."""
     return equity > MIN_EQUITY_USD
+
+
+# An account sitting at its margin cap rejects every incoming signal, so this rejection
+# repeats at signal cadence (~every 5 min) for as long as the account stays full — which
+# buries Telegram in identical alerts. Notify once per window and tally the rest. Every
+# rejection is still logged and recorded in signal_log regardless.
+BALANCE_NOTIFY_COOLDOWN_SECONDS = 6 * 3600
+INSUFFICIENT_BALANCE_PREFIX = "insufficient balance"
+
+_last_balance_notify_at: float | None = None
+_balance_rejections_muted = 0
+
+
+def is_balance_rejection(rejection: str) -> bool:
+    return rejection.startswith(INSUFFICIENT_BALANCE_PREFIX)
+
+
+def claim_balance_notify_slot(now: float | None = None) -> bool:
+    """True at most once per BALANCE_NOTIFY_COOLDOWN_SECONDS; counts the muted ones.
+
+    monotonic() so a system clock adjustment cannot mute alerts for hours. The None
+    sentinel (rather than 0.0) makes the first rejection always notify — monotonic()
+    counts from boot, so a 0.0 start would read as "just notified" and swallow it.
+    """
+    global _last_balance_notify_at, _balance_rejections_muted
+    now = time.monotonic() if now is None else now
+    if (
+        _last_balance_notify_at is not None
+        and now - _last_balance_notify_at < BALANCE_NOTIFY_COOLDOWN_SECONDS
+    ):
+        _balance_rejections_muted += 1
+        return False
+    _last_balance_notify_at = now
+    return True
+
+
+def take_muted_balance_count() -> int:
+    """Muted rejections since the last notification. Resets the tally."""
+    global _balance_rejections_muted
+    count = _balance_rejections_muted
+    _balance_rejections_muted = 0
+    return count
 
 
 def fetch_spot_usdc(info: Info, address: str) -> float:
@@ -408,6 +451,26 @@ async def _open_with_tpsl(
     return fill_price, tp_ok, sl_ok
 
 
+def _should_notify_rejection(rejection: str) -> bool:
+    """Balance rejections are rate-limited; every other reason notifies immediately."""
+    if not is_balance_rejection(rejection):
+        return True
+    return claim_balance_notify_slot()
+
+
+def _format_rejection(coin: str, direction: str, rejection: str) -> str:
+    message = f"⏭ {coin} {direction} skipped — <code>{rejection}</code>"
+    if not is_balance_rejection(rejection):
+        return message
+    # Only reachable right after claiming the slot, so the tally is the muted run that
+    # this message stands in for — without it the mute would hide how jammed the account is.
+    muted = take_muted_balance_count()
+    if muted:
+        hours = BALANCE_NOTIFY_COOLDOWN_SECONDS // 3600
+        message += f"\n<i>+{muted} more muted in the last {hours}h</i>"
+    return message
+
+
 async def execute_signal(
     signal: dict,
     info: Info,
@@ -458,8 +521,8 @@ async def execute_signal(
                 "reason": rejection,
             }
         )
-        if notify:
-            await notify(f"⏭ {coin} {direction} skipped — <code>{rejection}</code>")
+        if notify and _should_notify_rejection(rejection):
+            await notify(_format_rejection(coin, direction, rejection))
         return
     logger.info(
         f"EXECUTING: {coin} {'LONG' if is_long else 'SHORT'}"
